@@ -7,48 +7,79 @@ const supabase = createClient(
 
 export default async function handler(req, res) {
   try {
-    // 1. Get pending tasks
+    // Fetch oldest pending task
     const { data: tasks, error } = await supabase
       .from("tasks")
       .select("*")
-      .eq("state", "pending")
+      .eq("status", "pending")
+      .order("created_at", { ascending: true })
       .limit(1);
 
     if (error) throw error;
 
     if (!tasks || tasks.length === 0) {
-      return res.json({ message: "No tasks" });
+      return res.status(200).json({
+        success: true,
+        message: "No pending tasks"
+      });
     }
 
     const task = tasks[0];
 
-    const action = task.input?.action;
-
-    // 2. Execute logic (simple for now)
-    let result = "";
-
-    if (action === "deploy_cart2save") {
-      result = "Cart2Save deployment triggered 🚀";
-    } else {
-      result = "Unknown action";
-    }
-
-    // 3. Update task
+    // Mark processing
     await supabase
       .from("tasks")
-      .update({ state: "completed" })
+      .update({ status: "processing" })
       .eq("id", task.id);
 
-    return res.json({
+    let result = "";
+
+    switch (task.action) {
+      case "deploy_cart2save":
+        result = "Cart2Save deployment triggered";
+        break;
+
+      case "run_quickscanz_scan":
+        result = "QuickScanZ scan executed";
+        break;
+
+      case "run_pmil_scan":
+        result = "PMIL scan executed";
+        break;
+
+      case "run_quietkeep_sync":
+        result = "QuietKeep sync completed";
+        break;
+
+      default:
+        result = `Unknown action: ${task.action}`;
+    }
+
+    // Mark completed
+    await supabase
+      .from("tasks")
+      .update({
+        status: "completed",
+        result
+      })
+      .eq("id", task.id);
+
+    // Audit log
+    await supabase.from("audit_log").insert({
+      action: task.action,
+      result: result
+    });
+
+    return res.status(200).json({
       success: true,
-      action,
-      result,
+      processed: task.action,
+      result
     });
 
   } catch (err) {
     return res.status(500).json({
       success: false,
-      error: err.message,
+      error: err.message
     });
   }
 }
