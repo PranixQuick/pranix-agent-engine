@@ -26,12 +26,13 @@ export default async function handler(req, res) {
     }
 
     // 🔥 Insert into Supabase
-    const { data, error } = await supabase.from("tasks").insert([
-      {
-        action: action,
-        status: "pending",
-      },
-    ]);
+    const { data, error } =  await supabase.from("tasks").insert([
+  {
+    agent_id: null,
+    input: { action },
+    state: "pending",
+  },
+]);
 
     if (error) {
       return res.status(500).json({
