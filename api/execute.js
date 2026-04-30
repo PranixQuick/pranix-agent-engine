@@ -10,36 +10,38 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Only POST allowed' });
   }
 
-  const { action, payload } = req.body || {};
+  try {
+    const { action } = req.body;
 
-  // 🔹 PING TEST
-  if (action === 'ping') {
+    // 1. Insert task
+    const { data: task, error: taskError } = await supabase
+      .from('tasks')
+      .insert([{ action, status: 'received' }])
+      .select()
+      .single();
+
+    if (taskError) throw taskError;
+
+    // 2. Log event
+    await supabase.from('audit_log').insert([
+      {
+        action,
+        status: 'logged',
+        task_id: task.id
+      }
+    ]);
+
+    // 3. Return response
     return res.status(200).json({
       success: true,
-      message: 'Pranix engine live ✅'
+      task_id: task.id,
+      message: `Action "${action}" stored ✅`
+    });
+
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      error: err.message
     });
   }
-
-  // 🔹 FETCH AGENTS
-  if (action === 'get_agents') {
-    const { data, error } = await supabase
-      .from('agents')
-      .select('*');
-
-    return res.status(200).json({ data, error });
-  }
-
-  // 🔹 CREATE TASK
-  if (action === 'create_task') {
-    const { data, error } = await supabase
-      .from('tasks')
-      .insert([{ input: payload, state: 'pending' }]);
-
-    return res.status(200).json({ data, error });
-  }
-
-  return res.status(200).json({
-    success: true,
-    received: { action, payload }
-  });
 }
