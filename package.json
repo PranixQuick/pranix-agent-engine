@@ -1,6 +1,6 @@
 {
   "name": "pranix-agent-engine",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "engines": { "node": ">=18.18 <23" },
   "dependencies": {
