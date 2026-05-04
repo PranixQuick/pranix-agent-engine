@@ -1,8 +1,12 @@
 {
   "crons": [
-    {
-      "path": "/api/worker",
-      "schedule": "*/1 * * * *"
-    }
-  ]
+    { "path": "/api/worker", "schedule": "*/1 * * * *" },
+    { "path": "/api/reap",   "schedule": "*/5 * * * *" }
+  ],
+  "functions": {
+    "api/worker.js": { "maxDuration": 60 },
+    "api/reap.js":   { "maxDuration": 30 },
+    "api/execute.js":{ "maxDuration": 10 },
+    "api/health.js": { "maxDuration": 10 }
+  }
 }
