@@ -1,0 +1,23 @@
+// vercel.json.patch
+// MERGE INSTRUCTION:
+// If your engine uses pages/api/ or app/api/ routing in Next.js,
+// the api/ directory files in this patch zip are auto-routed by Vercel —
+// no vercel.json change needed.
+//
+// If the engine has a vercel.json with explicit "functions" or "rewrites"
+// blocks, ensure these two endpoints are reachable:
+//
+//   POST /api/github_webhook
+//   POST /api/vercel_webhook
+//
+// Both must:
+//   - accept POST only
+//   - have raw body access for HMAC signature verification
+//   - return 200 fast (< 5s) — webhook providers retry on timeout
+//
+// REQUIRED ENV VARS in Vercel for pranix-agent-engine:
+//   GITHUB_WEBHOOK_SECRET   (generate: openssl rand -hex 32)
+//   VERCEL_WEBHOOK_SECRET   (generate: openssl rand -hex 32)
+//
+// (Plus the already-present: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+//  GITHUB_PAT, GITHUB_SECONDARY_PAT, VERCEL_TOKEN, VERCEL_SECONDARY_TOKEN)
