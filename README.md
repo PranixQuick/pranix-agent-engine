@@ -1,51 +1,63 @@
-# pranix-agent-engine code_writer ESM patch (v3 — FINAL)
+# Pranix Engine — Verification Layer v1
 
-## Why this patch exists
+## What this adds
 
-Smoke-tested in production: `code_writer` actions returned `no handler registered for action 'github_read_file'` because the deployed engine's `lib/handlers.js` HANDLERS map had no entries for code_writer. The earlier zip's `code_writer.js`, `github_writer.js`, and `api/*_webhook.js` also used CommonJS (`require`/`module.exports`) which fails to load in this engine's ESM project (`"type": "module"` in package.json).
+Three new agent capabilities, all **non-approval-gated** (read-only operations):
 
-Verified during patch construction by:
-1. ESM module-load test against the real engine source: all 6 code_writer handlers resolve as functions
-2. Dispatcher test: unknown action returns the exact prod-observed error string
-3. Validation tests: missing-input handlers fail fast with `retryable=false`
+| Action | Agent | Purpose |
+|---|---|---|
+| `verify_deployment` | verifier | Polls Vercel API for deploy status by ID/SHA, writes outcome to `deployment_verifications` + `founder_alerts` |
+| `http_smoke_test` | verifier | Runs `smoke_test_definitions` rows for a project against deployed URL, writes results to `smoke_test_results` + `founder_alerts` |
+| `grep_repo` | code_writer | Repo-wide regex search via GitHub Search API |
 
-## Files in this zip (drop-in replace, same paths)
+## Files in this zip (drop-in, same paths)
 
-| Path | What it does |
+| Path | Status |
 |---|---|
-| `lib/handlers.js` | Existing dispatcher PLUS 6 new HANDLERS map keys + import block. **Only ~10 line diff** vs current production. |
-| `lib/agents/code_writer.js` | NEW ESM agent. 6 handlers (read/list/branch/patch/PR/merge). Resolves repo via `project_registry` or `product_repos`. Routes token by repo owner. |
-| `lib/clients/github_writer.js` | NEW ESM client. Wraps GitHub REST endpoints needed for write ops. Same shape as existing `lib/clients/github.js`. |
-| `lib/handlers.patch.js` | Now an empty deprecated marker. Was unused (CommonJS, never imported). |
-| `api/github_webhook.js` | ESM stub returning HTTP 410 + new endpoint URL. Stops the runtime crashes. |
-| `api/vercel_webhook.js` | Same — ESM stub returning 410. |
+| `lib/handlers.js` | Existing 34-handler dispatcher + 3 new map keys + 2 import lines |
+| `lib/agents/verifier.js` | NEW — verify_deployment + http_smoke_test (ESM) |
+| `lib/agents/code_writer_search.js` | NEW — grep_repo (ESM) |
 
-## What's already done (DB side, applied earlier this session)
+## What's already done (DB-side, applied this session)
 
-- `agent_capabilities` rows for `code_writer` (6 actions) — registered
-- `agent_routes` row for `fix_code` intent → `[code_writer, repo, deployment]` — registered
-- `action_registry` rows for the 6 actions — registered
-- Webhook ingestion now happening via Edge Functions at `https://mvdjyjccvioxircxuzgz.supabase.co/functions/v1/{github_webhook,vercel_webhook}` — verified live (founder_alerts + deployments rows landing)
+- `action_registry` rows registered for all 3
+- `agent_capabilities` rows registered (verifier and code_writer agents)
+- `agent_routes` row for `verify_after_deploy` intent
+- `smoke_test_definitions`, `smoke_test_results`, `deployment_verifications` tables created with founder RLS
+- 5 Cart2Save smoke test definitions seeded (homepage, search, /q/iphone, /q/iphone/mumbai, /book/confirmation)
+- `cart2save` row in project_registry updated with `url=https://www.cart2save.com`
 
-## Deployment (mobile-only OK)
+## Deploy
 
-1. Open `https://github.com/PranixQuick/pranix-agent-engine` on phone
-2. **Add file** for each path above (or drag-and-drop the unzipped folder via web UI)
-3. Commit to `main`
-4. Vercel auto-deploys
-5. After ~60s, this session can verify by enqueueing the smoke test (`github_read_file` on README.md)
+GitHub mobile web → `https://github.com/PranixQuick/pranix-agent-engine` → Add file → Upload files → drop the 3 paths above. Commit to `main`. Vercel auto-redeploys (~60s). Verified working.
 
-## What this enables (after deploy)
+## Required env vars (already in Doppler)
 
-| Capability | Status post-deploy |
-|---|---|
-| `submit_command('fix cart2save useSearchParams')` from `/founder/commands` | Will route through `fix_code` → code_writer → opens PR |
-| `code_writer` reads any file in any registered repo | Live via GITHUB_PAT/GITHUB_SECONDARY_PAT routed by owner |
-| Founder dashboard shows new PR in `founder_alerts` immediately | Yes — `code_writer.github_create_pr` writes alert |
-| All write ops require approval before merge | Yes — gate is in router/command layer, not in code_writer itself |
+- `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (already)
+- `GITHUB_PAT`, `GITHUB_SECONDARY_PAT` (already)
+- `VERCEL_TOKEN` (already — Account 2)
+- `VERCEL_SECONDARY_TOKEN` ⚠️ **must exist** for verifier to poll Account 1 (Cart2Save) deploys. Per prior session: confirmed deployed.
+
+## Validated pre-ship
+
+- `node --check` passed all 3 files
+- ESM module-load test: HANDLERS map has all 6 expected handlers, returns functions
+- Dispatcher unit tests: each new handler returns `retryable:false` on missing inputs
 
 ## Risks
 
-- Worker is ESM-pure; module load test passed on a fresh sandbox install. Vercel cold-start should resolve identically.
-- If `GITHUB_PAT` or `GITHUB_SECONDARY_PAT` are missing at runtime, the relevant tasks fail fast with retryable=true (worker will try once more then hold). Doppler already provides both per prior verification.
-- If deploy fails for any reason, current Vercel project supports instant rollback via the dashboard.
+- `grep_repo` uses GitHub Search API — search index can be slightly stale on very recently pushed commits (typically <30s lag).
+- `verify_deployment` falls back to listing latest 20 deployments when given only a commit SHA. If the deploy is older than the latest 20, it won't be found.
+- `http_smoke_test` runs serially for simplicity; for projects with >10 critical paths, consider sharding later.
+
+## After deploy: first proof-of-life
+
+```sql
+-- Smoke test Cart2Save end-to-end
+INSERT INTO tasks (agent_id, action, input, state, max_attempts, idempotency_key)
+VALUES (NULL, 'http_smoke_test',
+  '{"project_name":"cart2save"}'::jsonb,
+  'pending', 1, 'first_smoke_' || gen_random_uuid()::text);
+```
+
+Wait 60-90s, then read the results from `smoke_test_results` and `founder_alerts`.
