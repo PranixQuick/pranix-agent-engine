@@ -1024,29 +1024,49 @@ function getTool(name) {
 }
 
 // api/mcp/[...path].ts
+var SERVER_INFO = {
+  name: "pranix-mcp-gateway",
+  version: "1.0.0"
+};
+var SERVER_CAPABILITIES = {
+  tools: { listChanged: false }
+};
+var ACTIVE_SESSIONS = /* @__PURE__ */ new Map();
 function nodeUrl(req) {
   const host = req.headers["x-forwarded-host"] ?? req.headers["host"] ?? "localhost";
   return new URL(req.url ?? "/", `https://${host}`);
 }
-function nodeHeaders(req) {
-  return {
-    get: (name) => {
-      const val = req.headers[name.toLowerCase()];
-      if (Array.isArray(val)) return val[0] ?? null;
-      return val ?? null;
-    }
-  };
-}
-function json(res, body, status = 200) {
+function sendJson(res, body, status = 200, extraHeaders) {
   const payload = JSON.stringify(body);
-  res.writeHead(status, { "Content-Type": "application/json" });
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id",
+    ...extraHeaders
+  });
   res.end(payload);
 }
-function rpcResult(res, id, result) {
-  json(res, { jsonrpc: "2.0", id, result });
+function mcpError(res, id, code, message) {
+  sendJson(res, { jsonrpc: "2.0", id, error: { code, message } });
 }
-function rpcError(res, id, code, message) {
-  json(res, { jsonrpc: "2.0", id, error: { code, message } });
+function mcpResult(res, id, result, extraHeaders) {
+  sendJson(res, { jsonrpc: "2.0", id, result }, 200, extraHeaders);
+}
+async function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk.toString();
+    });
+    req.on("end", () => {
+      try {
+        resolve(data ? JSON.parse(data) : {});
+      } catch {
+        reject(new Error("invalid_json"));
+      }
+    });
+    req.on("error", reject);
+  });
 }
 function inferResource(toolName, params) {
   if (toolName.startsWith("github_") && typeof params.repo === "string") return `github:repo:${params.repo}`;
@@ -1062,86 +1082,166 @@ function inferResource(toolName, params) {
   }
   return `tool:${toolName}`;
 }
-async function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", (chunk) => {
-      data += chunk;
-    });
-    req.on("end", () => {
-      try {
-        resolve(data ? JSON.parse(data) : {});
-      } catch {
-        reject(new Error("invalid_json"));
-      }
-    });
-    req.on("error", reject);
-  });
+async function resolveAuth(req, args) {
+  const headerToken = (req.headers["authorization"] ?? "").replace(/^Bearer\s+/i, "").trim();
+  const argToken = args["_bearer"] ?? "";
+  const token = headerToken || argToken;
+  if (!token) return null;
+  return resolveClient(token);
 }
 async function handler(req, res) {
-  const request_id = randomUUID2();
-  const startedAt = Date.now();
-  const headers = nodeHeaders(req);
   const url = nodeUrl(req);
-  if (req.method === "GET" && url.pathname.endsWith("/health")) {
-    return json(res, { ok: true, gateway: "pranix-mcp-gateway", version: "1.0.0", request_id });
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id, Accept"
+    });
+    return void res.end();
   }
-  if (req.method !== "POST") return json(res, { error: "method_not_allowed" }, 405);
-  const bearer = (headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
-  const auth = await resolveClient(bearer);
-  if (!auth) {
-    await writeAudit({ auth: null, tool_name: "(auth)", scope_used: "(none)", status_code: 401, latency_ms: Date.now() - startedAt, error_kind: "auth_fail", request_id });
-    return json(res, { error: "unauthorized" }, 401);
+  if (req.method === "GET") {
+    const sessionId = req.headers["mcp-session-id"];
+    if (!sessionId || !ACTIVE_SESSIONS.has(sessionId)) {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Access-Control-Allow-Origin": "*"
+      });
+      res.write(": pranix-mcp-gateway stream open\n\n");
+      const ping2 = setInterval(() => {
+        res.write(": ping\n\n");
+      }, 25e3);
+      req.on("close", () => clearInterval(ping2));
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "Access-Control-Allow-Origin": "*"
+    });
+    res.write(": pranix-mcp-gateway stream open\n\n");
+    const ping = setInterval(() => {
+      res.write(": ping\n\n");
+    }, 25e3);
+    req.on("close", () => clearInterval(ping));
+    return;
+  }
+  if (req.method === "DELETE") {
+    const sessionId = req.headers["mcp-session-id"];
+    if (sessionId) ACTIVE_SESSIONS.delete(sessionId);
+    res.writeHead(204);
+    return void res.end();
+  }
+  if (req.method !== "POST") {
+    sendJson(res, { error: "method_not_allowed" }, 405);
+    return;
   }
   let body;
   try {
     body = await readBody(req);
   } catch {
-    return rpcError(res, null, -32700, "parse_error");
+    return void mcpError(res, null, -32700, "parse_error");
   }
   const { id = null, method = "", params = {} } = body;
-  if (method === "list_tools") {
-    const tools = listTools().map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
-    await writeAudit({ auth, tool_name: "list_tools", scope_used: "read", status_code: 200, latency_ms: Date.now() - startedAt, request_id });
-    return rpcResult(res, id, { tools });
+  if (method === "initialize") {
+    const sessionId = randomUUID2();
+    ACTIVE_SESSIONS.set(sessionId, { createdAt: Date.now() });
+    if (ACTIVE_SESSIONS.size > 100) {
+      const oldestKey = ACTIVE_SESSIONS.keys().next().value;
+      if (oldestKey) ACTIVE_SESSIONS.delete(oldestKey);
+    }
+    return void mcpResult(res, id, {
+      protocolVersion: "2025-03-26",
+      capabilities: SERVER_CAPABILITIES,
+      serverInfo: SERVER_INFO,
+      instructions: "Pranix MCP Gateway V1. Use Bearer token in Authorization header or pass _bearer argument. Call mcp_route_task before any data tool."
+    }, { "Mcp-Session-Id": sessionId });
   }
-  if (method === "call_tool") {
+  if (method === "notifications/initialized") {
+    res.writeHead(202);
+    return void res.end();
+  }
+  if (method === "ping") {
+    return void mcpResult(res, id, {});
+  }
+  if (method === "tools/list") {
+    const tools = listTools().map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: {
+        ...t.inputSchema,
+        // Inject _bearer as optional field on every tool so clients can pass auth inline
+        properties: {
+          ...t.inputSchema.properties ?? {},
+          _bearer: {
+            type: "string",
+            description: "Optional: Pranix bearer token (pmcp_...). Can also be passed in Authorization header."
+          }
+        }
+      }
+    }));
+    return void mcpResult(res, id, { tools });
+  }
+  if (method === "tools/call") {
     const toolName = params.name;
     const args = params.arguments ?? {};
-    if (!toolName) return rpcError(res, id, -32602, "invalid_params: missing name");
+    const request_id = randomUUID2();
+    const startedAt = Date.now();
+    if (!toolName) return void mcpError(res, id, -32602, "invalid_params: missing name");
     const tool = getTool(toolName);
-    if (!tool) return rpcError(res, id, -32601, `tool_not_found: ${toolName}`);
+    if (!tool) return void mcpError(res, id, -32601, `tool_not_found: ${toolName}`);
+    const auth = await resolveAuth(req, args);
+    if (!auth) {
+      return void mcpResult(res, id, {
+        content: [{ type: "text", text: JSON.stringify({ error: "unauthorized", hint: "Pass bearer token in Authorization header or _bearer argument" }) }],
+        isError: true
+      });
+    }
     const resource = inferResource(toolName, args);
     const authz = await authorize(auth, tool.scope, resource);
     if (!authz.ok) {
       await writeAudit({ auth, tool_name: toolName, scope_used: tool.scope, resource, status_code: 403, latency_ms: Date.now() - startedAt, error_kind: "authz_fail", request_id });
-      return rpcError(res, id, -32e3, `authz_denied: ${authz.reason}`);
+      return void mcpResult(res, id, {
+        content: [{ type: "text", text: JSON.stringify({ error: "forbidden", reason: authz.reason }) }],
+        isError: true
+      });
     }
     const exempt = tool.exempt_from_routing ?? await isRoutingExempt(toolName);
     let routing = null;
     if (!exempt) {
-      const routingToken = args["routing_token"] ?? args["_routing_token"] ?? headers.get("x-pmcp-routing-token");
+      const routingToken = args["routing_token"] ?? args["_routing_token"];
       if (!routingToken) {
-        await writeAudit({ auth, tool_name: toolName, scope_used: tool.scope, resource, status_code: 428, latency_ms: Date.now() - startedAt, error_kind: "routing_token_missing", request_id });
-        return rpcError(res, id, -32001, "routing_token_required: call mcp_route_task first");
+        return void mcpResult(res, id, {
+          content: [{ type: "text", text: JSON.stringify({ error: "routing_token_required", hint: "Call mcp_route_task first, then pass routing_token in arguments" }) }],
+          isError: true
+        });
       }
       routing = await resolveRouting(routingToken);
       if (!routing) {
-        await writeAudit({ auth, tool_name: toolName, scope_used: tool.scope, resource, status_code: 428, latency_ms: Date.now() - startedAt, error_kind: "routing_token_invalid_or_expired", request_id });
-        return rpcError(res, id, -32001, "routing_token_invalid_or_expired");
+        return void mcpResult(res, id, {
+          content: [{ type: "text", text: JSON.stringify({ error: "routing_token_invalid_or_expired" }) }],
+          isError: true
+        });
       }
     }
     try {
       const output = await tool.handler(args, { auth, routing, request_id });
-      const outBytes = JSON.stringify(output).length;
-      await writeAudit({ auth, tool_name: toolName, scope_used: tool.scope, resource, status_code: 200, latency_ms: Date.now() - startedAt, output_size: outBytes, request_id });
-      return rpcResult(res, id, { content: [{ type: "text", text: JSON.stringify(output) }] });
+      const outStr = JSON.stringify(output);
+      await writeAudit({ auth, tool_name: toolName, scope_used: tool.scope, resource, status_code: 200, latency_ms: Date.now() - startedAt, output_size: outStr.length, request_id });
+      return void mcpResult(res, id, {
+        content: [{ type: "text", text: outStr }]
+      });
     } catch (e) {
       await writeAudit({ auth, tool_name: toolName, scope_used: tool.scope, resource, status_code: 500, latency_ms: Date.now() - startedAt, error_kind: "tool_error", request_id });
-      return rpcError(res, id, -32603, `tool_error: ${e.message}`);
+      return void mcpResult(res, id, {
+        content: [{ type: "text", text: JSON.stringify({ error: "tool_error", detail: e.message }) }],
+        isError: true
+      });
     }
   }
-  return rpcError(res, id, -32601, `method_not_found: ${method}`);
+  return void mcpError(res, id, -32601, `method_not_found: ${method}`);
 }
 export {
   handler as default

@@ -1038,9 +1038,29 @@ function nodeHeaders(req) {
   };
 }
 function json(res, body, status = 200) {
-  const payload = JSON.stringify(body);
-  res.writeHead(status, { "Content-Type": "application/json" });
+  const payload = JSON.stringify(body, null, 2);
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization"
+  });
   res.end(payload);
+}
+async function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk.toString();
+    });
+    req.on("end", () => {
+      try {
+        resolve(data ? JSON.parse(data) : {});
+      } catch {
+        reject(new Error("invalid_json"));
+      }
+    });
+    req.on("error", reject);
+  });
 }
 function inferResource(toolName, params) {
   if (toolName.startsWith("github_") && typeof params.repo === "string") return `github:repo:${params.repo}`;
@@ -1056,41 +1076,79 @@ function inferResource(toolName, params) {
   }
   return `tool:${toolName}`;
 }
-async function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", (chunk) => {
-      data += chunk;
-    });
-    req.on("end", () => {
-      try {
-        resolve(data ? JSON.parse(data) : {});
-      } catch {
-        reject(new Error("invalid_json"));
-      }
-    });
-    req.on("error", reject);
-  });
+function toOperationId(name) {
+  return name.replace(/[^a-zA-Z0-9_]/g, "_");
 }
-function buildOpenApiSpec() {
+function toSchemaName(name) {
+  return name.split("_").map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join("");
+}
+function buildOpenApiSpec(baseUrl) {
+  const tools = listTools();
   const paths = {
-    "/api/openapi/health": { get: { summary: "Liveness", responses: { "200": { description: "ok" } } } }
+    "/api/openapi/health": {
+      get: {
+        operationId: "getHealth",
+        summary: "Gateway health check",
+        responses: { "200": { description: "ok" } }
+      }
+    }
   };
-  for (const tool of listTools()) {
+  const schemas = {};
+  for (const tool of tools) {
+    const opId = toOperationId(tool.name);
+    const schemaName = `${toSchemaName(tool.name)}Input`;
+    const inputSchema = tool.inputSchema;
+    schemas[schemaName] = {
+      type: "object",
+      description: tool.description.slice(0, 300),
+      properties: {
+        ...inputSchema.properties ?? {}
+      },
+      ...inputSchema.required ? { required: inputSchema.required } : {}
+    };
     paths[`/api/openapi/${tool.name}`] = {
       post: {
-        summary: tool.description.slice(0, 200),
-        security: [{ bearer: [] }],
-        requestBody: { required: true, content: { "application/json": { schema: tool.inputSchema } } },
-        responses: { "200": { description: "tool output" }, "401": { description: "unauthorized" }, "403": { description: "authz denied" }, "428": { description: "routing_token required" } }
+        operationId: opId,
+        summary: tool.description.slice(0, 120),
+        description: tool.description.slice(0, 500),
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: { $ref: `#/components/schemas/${schemaName}` }
+            }
+          }
+        },
+        responses: {
+          "200": { description: "Tool output" },
+          "401": { description: "Unauthorized \u2014 missing or invalid bearer token" },
+          "403": { description: "Forbidden \u2014 insufficient scope" },
+          "404": { description: "Tool not found" },
+          "428": { description: "Routing token required \u2014 call mcp_route_task first" },
+          "500": { description: "Tool execution error" }
+        }
       }
     };
   }
   return {
     openapi: "3.1.0",
-    info: { title: "Pranix MCP Gateway", version: "1.0.0", description: "Vendor-agnostic AI infrastructure layer." },
-    servers: [{ url: process.env.PMCP_PUBLIC_URL ?? "https://pranix-agent-engine.vercel.app" }],
-    components: { securitySchemes: { bearer: { type: "http", scheme: "bearer", bearerFormat: "pmcp_*" } } },
+    info: {
+      title: "Pranix MCP Gateway",
+      version: "1.0.0",
+      description: "Vendor-agnostic AI infrastructure layer for Pranix products. Provides tools to read GitHub, Supabase, Vercel, Doppler and route operational tasks across products."
+    },
+    servers: [{ url: baseUrl }],
+    components: {
+      securitySchemes: {
+        bearerAuth: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "pmcp_*"
+        }
+      },
+      schemas
+    },
     paths
   };
 }
@@ -1099,57 +1157,65 @@ async function handler(req, res) {
   const startedAt = Date.now();
   const headers = nodeHeaders(req);
   const url = nodeUrl(req);
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization"
+    });
+    return void res.end();
+  }
   const segs = url.pathname.split("/").filter(Boolean);
   const toolNameOrAction = segs[segs.length - 1] ?? "";
-  if (req.method === "GET" && toolNameOrAction === "health") {
-    return json(res, { ok: true, gateway: "pranix-mcp-gateway", request_id });
+  const baseUrl = `https://${url.host}`;
+  if (req.method === "GET") {
+    if (toolNameOrAction === "health") {
+      return void json(res, { ok: true, gateway: "pranix-mcp-gateway", request_id });
+    }
+    return void json(res, buildOpenApiSpec(baseUrl));
   }
-  if (req.method === "GET" && (toolNameOrAction === "openapi" || url.pathname === "/api/openapi" || url.pathname === "/api/openapi/")) {
-    return json(res, buildOpenApiSpec());
-  }
-  if (req.method !== "POST") return json(res, { error: "method_not_allowed" }, 405);
-  const bearer = (headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  if (req.method !== "POST") return void json(res, { error: "method_not_allowed" }, 405);
+  const bearer = (headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
   const auth = await resolveClient(bearer);
   if (!auth) {
     await writeAudit({ auth: null, tool_name: "(auth)", scope_used: "(none)", status_code: 401, latency_ms: Date.now() - startedAt, error_kind: "auth_fail", request_id });
-    return json(res, { error: "unauthorized" }, 401);
+    return void json(res, { error: "unauthorized", hint: "Add Authorization: Bearer pmcp_... header" }, 401);
   }
   const tool = getTool(toolNameOrAction);
-  if (!tool) return json(res, { error: "tool_not_found", tool: toolNameOrAction }, 404);
+  if (!tool) return void json(res, { error: "tool_not_found", tool: toolNameOrAction }, 404);
   let args;
   try {
     args = await readBody(req);
   } catch {
-    return json(res, { error: "invalid_json_body" }, 400);
+    return void json(res, { error: "invalid_json_body" }, 400);
   }
   const resource = inferResource(tool.name, args);
   const authz = await authorize(auth, tool.scope, resource);
   if (!authz.ok) {
     await writeAudit({ auth, tool_name: tool.name, scope_used: tool.scope, resource, status_code: 403, latency_ms: Date.now() - startedAt, error_kind: "authz_fail", request_id });
-    return json(res, { error: "forbidden", reason: authz.reason }, 403);
+    return void json(res, { error: "forbidden", reason: authz.reason }, 403);
   }
   const exempt = tool.exempt_from_routing ?? await isRoutingExempt(tool.name);
   let routing = null;
   if (!exempt) {
-    const routingToken = args["routing_token"] ?? headers.get("x-pmcp-routing-token");
+    const routingToken = args["routing_token"];
     if (!routingToken) {
       await writeAudit({ auth, tool_name: tool.name, scope_used: tool.scope, resource, status_code: 428, latency_ms: Date.now() - startedAt, error_kind: "routing_token_missing", request_id });
-      return json(res, { error: "routing_token_required", hint: "call /api/openapi/mcp_route_task first" }, 428);
+      return void json(res, { error: "routing_token_required", hint: "POST to /api/openapi/mcp_route_task first, then pass routing_token" }, 428);
     }
     routing = await resolveRouting(routingToken);
     if (!routing) {
-      await writeAudit({ auth, tool_name: tool.name, scope_used: tool.scope, resource, status_code: 428, latency_ms: Date.now() - startedAt, error_kind: "routing_token_invalid_or_expired", request_id });
-      return json(res, { error: "routing_token_invalid_or_expired" }, 428);
+      return void json(res, { error: "routing_token_invalid_or_expired" }, 428);
     }
   }
   try {
     const output = await tool.handler(args, { auth, routing, request_id });
     const outBytes = JSON.stringify(output).length;
     await writeAudit({ auth, tool_name: tool.name, scope_used: tool.scope, resource, status_code: 200, latency_ms: Date.now() - startedAt, output_size: outBytes, request_id });
-    return json(res, output);
+    return void json(res, output);
   } catch (e) {
     await writeAudit({ auth, tool_name: tool.name, scope_used: tool.scope, resource, status_code: 500, latency_ms: Date.now() - startedAt, error_kind: "tool_error", request_id });
-    return json(res, { error: "tool_error", detail: e.message }, 500);
+    return void json(res, { error: "tool_error", detail: e.message }, 500);
   }
 }
 export {
