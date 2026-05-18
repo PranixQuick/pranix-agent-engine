@@ -6,10 +6,10 @@ import { createHash } from "node:crypto";
 
 // lib/db.ts
 import { createClient } from "@supabase/supabase-js";
-var SUPABASE_URL = process.env.PMCP_CONTROL_PLANE_URL ?? "https://mvdjyjccvioxircxuzgz.supabase.co";
-var SERVICE_KEY = process.env.PMCP_CONTROL_PLANE_SERVICE_KEY;
+var SUPABASE_URL = process.env.PMCP_CONTROL_PLANE_URL ?? process.env.SUPABASE_URL ?? "https://mvdjyjccvioxircxuzgz.supabase.co";
+var SERVICE_KEY = process.env.PMCP_CONTROL_PLANE_SERVICE_KEY ?? process.env.SUPABASE_SERVICE_KEY ?? "";
 if (!SERVICE_KEY) {
-  throw new Error("PMCP_CONTROL_PLANE_SERVICE_KEY env var is required");
+  console.error("[pranix-mcp] WARNING: No Supabase service key found. Set PMCP_CONTROL_PLANE_SERVICE_KEY or SUPABASE_SERVICE_KEY.");
 }
 var db = createClient(SUPABASE_URL, SERVICE_KEY, {
   auth: { persistSession: false },
