@@ -1050,7 +1050,9 @@ function inferResource(toolName, params) {
 async function handler(req) {
   const request_id = randomUUID2();
   const startedAt = Date.now();
-  if (req.method === "GET" && new URL(req.url).pathname.endsWith("/health")) {
+  const _host = req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? "localhost";
+  const _url = new URL(req.url, `https://${_host}`);
+  if (req.method === "GET" && _url.pathname.endsWith("/health")) {
     return jsonResp({ ok: true, gateway: "pranix-mcp-gateway", version: "1.0.0", request_id });
   }
   if (req.method !== "POST") return jsonResp({ error: "method_not_allowed" }, 405);

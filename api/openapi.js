@@ -1068,7 +1068,8 @@ function buildOpenApiSpec() {
 async function handler(req) {
   const request_id = randomUUID2();
   const startedAt = Date.now();
-  const url = new URL(req.url);
+  const _host = req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? "localhost";
+  const url = new URL(req.url, `https://${_host}`);
   const segs = url.pathname.split("/").filter(Boolean);
   const toolNameOrAction = segs[segs.length - 1] ?? "";
   if (req.method === "GET" && toolNameOrAction === "health") {
