@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 // lib/db.ts
 import { createClient } from "@supabase/supabase-js";
 var SUPABASE_URL = process.env.PMCP_CONTROL_PLANE_URL ?? process.env.SUPABASE_URL ?? "https://mvdjyjccvioxircxuzgz.supabase.co";
-var SERVICE_KEY = process.env.PMCP_CONTROL_PLANE_SERVICE_KEY ?? process.env.SUPABASE_SERVICE_KEY ?? "";
+var SERVICE_KEY = process.env.PMCP_CONTROL_PLANE_SERVICE_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 if (!SERVICE_KEY) {
   console.error("[pranix-mcp] WARNING: No Supabase service key found. Set PMCP_CONTROL_PLANE_SERVICE_KEY or SUPABASE_SERVICE_KEY.");
 }
@@ -1024,14 +1024,29 @@ function getTool(name) {
 }
 
 // api/mcp/[...path].ts
-function jsonResp(body, status = 200) {
-  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+function nodeUrl(req) {
+  const host = req.headers["x-forwarded-host"] ?? req.headers["host"] ?? "localhost";
+  return new URL(req.url ?? "/", `https://${host}`);
 }
-function rpcResult(id, result) {
-  return jsonResp({ jsonrpc: "2.0", id, result });
+function nodeHeaders(req) {
+  return {
+    get: (name) => {
+      const val = req.headers[name.toLowerCase()];
+      if (Array.isArray(val)) return val[0] ?? null;
+      return val ?? null;
+    }
+  };
 }
-function rpcError(id, code, message, data) {
-  return jsonResp({ jsonrpc: "2.0", id, error: { code, message, data } }, 200);
+function json(res, body, status = 200) {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(payload);
+}
+function rpcResult(res, id, result) {
+  json(res, { jsonrpc: "2.0", id, result });
+}
+function rpcError(res, id, code, message) {
+  json(res, { jsonrpc: "2.0", id, error: { code, message } });
 }
 function inferResource(toolName, params) {
   if (toolName.startsWith("github_") && typeof params.repo === "string") return `github:repo:${params.repo}`;
@@ -1042,80 +1057,91 @@ function inferResource(toolName, params) {
     try {
       return `browser:domain:${new URL(params.url).hostname}`;
     } catch {
-      return `browser:domain:invalid`;
+      return "browser:domain:invalid";
     }
   }
   return `tool:${toolName}`;
 }
-async function handler(req) {
+async function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+    });
+    req.on("end", () => {
+      try {
+        resolve(data ? JSON.parse(data) : {});
+      } catch {
+        reject(new Error("invalid_json"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+async function handler(req, res) {
   const request_id = randomUUID2();
   const startedAt = Date.now();
-  const _host = req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? "localhost";
-  const _url = new URL(req.url, `https://${_host}`);
-  if (req.method === "GET" && _url.pathname.endsWith("/health")) {
-    return jsonResp({ ok: true, gateway: "pranix-mcp-gateway", version: "1.0.0", request_id });
+  const headers = nodeHeaders(req);
+  const url = nodeUrl(req);
+  if (req.method === "GET" && url.pathname.endsWith("/health")) {
+    return json(res, { ok: true, gateway: "pranix-mcp-gateway", version: "1.0.0", request_id });
   }
-  if (req.method !== "POST") return jsonResp({ error: "method_not_allowed" }, 405);
-  const bearer = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  if (req.method !== "POST") return json(res, { error: "method_not_allowed" }, 405);
+  const bearer = (headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
   const auth = await resolveClient(bearer);
   if (!auth) {
     await writeAudit({ auth: null, tool_name: "(auth)", scope_used: "(none)", status_code: 401, latency_ms: Date.now() - startedAt, error_kind: "auth_fail", request_id });
-    return jsonResp({ error: "unauthorized" }, 401);
+    return json(res, { error: "unauthorized" }, 401);
   }
   let body;
   try {
-    body = await req.json();
+    body = await readBody(req);
   } catch {
-    return rpcError(null, -32700, "parse_error");
+    return rpcError(res, null, -32700, "parse_error");
   }
-  const { id = null, method, params = {} } = body;
+  const { id = null, method = "", params = {} } = body;
   if (method === "list_tools") {
-    const tools = listTools().map((t) => ({
-      name: t.name,
-      description: t.description,
-      inputSchema: t.inputSchema
-    }));
+    const tools = listTools().map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
     await writeAudit({ auth, tool_name: "list_tools", scope_used: "read", status_code: 200, latency_ms: Date.now() - startedAt, request_id });
-    return rpcResult(id, { tools });
+    return rpcResult(res, id, { tools });
   }
   if (method === "call_tool") {
     const toolName = params.name;
     const args = params.arguments ?? {};
-    if (!toolName) return rpcError(id, -32602, "invalid_params: missing 'name'");
+    if (!toolName) return rpcError(res, id, -32602, "invalid_params: missing name");
     const tool = getTool(toolName);
-    if (!tool) return rpcError(id, -32601, `tool_not_found: ${toolName}`);
+    if (!tool) return rpcError(res, id, -32601, `tool_not_found: ${toolName}`);
     const resource = inferResource(toolName, args);
     const authz = await authorize(auth, tool.scope, resource);
     if (!authz.ok) {
       await writeAudit({ auth, tool_name: toolName, scope_used: tool.scope, resource, status_code: 403, latency_ms: Date.now() - startedAt, error_kind: "authz_fail", request_id });
-      return rpcError(id, -32e3, `authz_denied: ${authz.reason}`);
+      return rpcError(res, id, -32e3, `authz_denied: ${authz.reason}`);
     }
     const exempt = tool.exempt_from_routing ?? await isRoutingExempt(toolName);
     let routing = null;
     if (!exempt) {
-      const routingToken = args["routing_token"] ?? args["_routing_token"] ?? req.headers.get("x-pmcp-routing-token");
+      const routingToken = args["routing_token"] ?? args["_routing_token"] ?? headers.get("x-pmcp-routing-token");
       if (!routingToken) {
         await writeAudit({ auth, tool_name: toolName, scope_used: tool.scope, resource, status_code: 428, latency_ms: Date.now() - startedAt, error_kind: "routing_token_missing", request_id });
-        return rpcError(id, -32001, "routing_token_required: call mcp_route_task or mcp_intake_submit first, then pass routing_token");
+        return rpcError(res, id, -32001, "routing_token_required: call mcp_route_task first");
       }
       routing = await resolveRouting(routingToken);
       if (!routing) {
         await writeAudit({ auth, tool_name: toolName, scope_used: tool.scope, resource, status_code: 428, latency_ms: Date.now() - startedAt, error_kind: "routing_token_invalid_or_expired", request_id });
-        return rpcError(id, -32001, "routing_token_invalid_or_expired");
+        return rpcError(res, id, -32001, "routing_token_invalid_or_expired");
       }
     }
     try {
       const output = await tool.handler(args, { auth, routing, request_id });
       const outBytes = JSON.stringify(output).length;
       await writeAudit({ auth, tool_name: toolName, scope_used: tool.scope, resource, status_code: 200, latency_ms: Date.now() - startedAt, output_size: outBytes, request_id });
-      return rpcResult(id, { content: [{ type: "text", text: JSON.stringify(output) }] });
+      return rpcResult(res, id, { content: [{ type: "text", text: JSON.stringify(output) }] });
     } catch (e) {
-      const msg = e.message;
       await writeAudit({ auth, tool_name: toolName, scope_used: tool.scope, resource, status_code: 500, latency_ms: Date.now() - startedAt, error_kind: "tool_error", request_id });
-      return rpcError(id, -32603, `tool_error: ${msg}`);
+      return rpcError(res, id, -32603, `tool_error: ${e.message}`);
     }
   }
-  return rpcError(id, -32601, `method_not_found: ${method}`);
+  return rpcError(res, id, -32601, `method_not_found: ${method}`);
 }
 export {
   handler as default

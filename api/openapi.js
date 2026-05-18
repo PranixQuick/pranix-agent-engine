@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 // lib/db.ts
 import { createClient } from "@supabase/supabase-js";
 var SUPABASE_URL = process.env.PMCP_CONTROL_PLANE_URL ?? process.env.SUPABASE_URL ?? "https://mvdjyjccvioxircxuzgz.supabase.co";
-var SERVICE_KEY = process.env.PMCP_CONTROL_PLANE_SERVICE_KEY ?? process.env.SUPABASE_SERVICE_KEY ?? "";
+var SERVICE_KEY = process.env.PMCP_CONTROL_PLANE_SERVICE_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 if (!SERVICE_KEY) {
   console.error("[pranix-mcp] WARNING: No Supabase service key found. Set PMCP_CONTROL_PLANE_SERVICE_KEY or SUPABASE_SERVICE_KEY.");
 }
@@ -1024,8 +1024,23 @@ function getTool(name) {
 }
 
 // api/openapi/[...path].ts
-function json(body, status = 200) {
-  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+function nodeUrl(req) {
+  const host = req.headers["x-forwarded-host"] ?? req.headers["host"] ?? "localhost";
+  return new URL(req.url ?? "/", `https://${host}`);
+}
+function nodeHeaders(req) {
+  return {
+    get: (name) => {
+      const val = req.headers[name.toLowerCase()];
+      if (Array.isArray(val)) return val[0] ?? null;
+      return val ?? null;
+    }
+  };
+}
+function json(res, body, status = 200) {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(payload);
 }
 function inferResource(toolName, params) {
   if (toolName.startsWith("github_") && typeof params.repo === "string") return `github:repo:${params.repo}`;
@@ -1036,16 +1051,30 @@ function inferResource(toolName, params) {
     try {
       return `browser:domain:${new URL(params.url).hostname}`;
     } catch {
-      return `browser:domain:invalid`;
+      return "browser:domain:invalid";
     }
   }
   return `tool:${toolName}`;
 }
+async function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+    });
+    req.on("end", () => {
+      try {
+        resolve(data ? JSON.parse(data) : {});
+      } catch {
+        reject(new Error("invalid_json"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
 function buildOpenApiSpec() {
   const paths = {
-    "/api/openapi/health": {
-      get: { summary: "Liveness", responses: { "200": { description: "ok" } } }
-    }
+    "/api/openapi/health": { get: { summary: "Liveness", responses: { "200": { description: "ok" } } } }
   };
   for (const tool of listTools()) {
     paths[`/api/openapi/${tool.name}`] = {
@@ -1060,67 +1089,67 @@ function buildOpenApiSpec() {
   return {
     openapi: "3.1.0",
     info: { title: "Pranix MCP Gateway", version: "1.0.0", description: "Vendor-agnostic AI infrastructure layer." },
-    servers: [{ url: process.env.PMCP_PUBLIC_URL ?? "https://pranix-mcp-gateway.vercel.app" }],
+    servers: [{ url: process.env.PMCP_PUBLIC_URL ?? "https://pranix-agent-engine.vercel.app" }],
     components: { securitySchemes: { bearer: { type: "http", scheme: "bearer", bearerFormat: "pmcp_*" } } },
     paths
   };
 }
-async function handler(req) {
+async function handler(req, res) {
   const request_id = randomUUID2();
   const startedAt = Date.now();
-  const _host = req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? "localhost";
-  const url = new URL(req.url, `https://${_host}`);
+  const headers = nodeHeaders(req);
+  const url = nodeUrl(req);
   const segs = url.pathname.split("/").filter(Boolean);
   const toolNameOrAction = segs[segs.length - 1] ?? "";
   if (req.method === "GET" && toolNameOrAction === "health") {
-    return json({ ok: true, gateway: "pranix-mcp-gateway", request_id });
+    return json(res, { ok: true, gateway: "pranix-mcp-gateway", request_id });
   }
-  if (req.method === "GET" && (toolNameOrAction === "openapi" || toolNameOrAction === "")) {
-    return json(buildOpenApiSpec());
+  if (req.method === "GET" && (toolNameOrAction === "openapi" || url.pathname === "/api/openapi" || url.pathname === "/api/openapi/")) {
+    return json(res, buildOpenApiSpec());
   }
-  if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
-  const bearer = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  if (req.method !== "POST") return json(res, { error: "method_not_allowed" }, 405);
+  const bearer = (headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
   const auth = await resolveClient(bearer);
   if (!auth) {
     await writeAudit({ auth: null, tool_name: "(auth)", scope_used: "(none)", status_code: 401, latency_ms: Date.now() - startedAt, error_kind: "auth_fail", request_id });
-    return json({ error: "unauthorized" }, 401);
+    return json(res, { error: "unauthorized" }, 401);
   }
   const tool = getTool(toolNameOrAction);
-  if (!tool) return json({ error: "tool_not_found", tool: toolNameOrAction }, 404);
+  if (!tool) return json(res, { error: "tool_not_found", tool: toolNameOrAction }, 404);
   let args;
   try {
-    args = await req.json();
+    args = await readBody(req);
   } catch {
-    return json({ error: "invalid_json_body" }, 400);
+    return json(res, { error: "invalid_json_body" }, 400);
   }
   const resource = inferResource(tool.name, args);
   const authz = await authorize(auth, tool.scope, resource);
   if (!authz.ok) {
     await writeAudit({ auth, tool_name: tool.name, scope_used: tool.scope, resource, status_code: 403, latency_ms: Date.now() - startedAt, error_kind: "authz_fail", request_id });
-    return json({ error: "forbidden", reason: authz.reason }, 403);
+    return json(res, { error: "forbidden", reason: authz.reason }, 403);
   }
   const exempt = tool.exempt_from_routing ?? await isRoutingExempt(tool.name);
   let routing = null;
   if (!exempt) {
-    const routingToken = args["routing_token"] ?? req.headers.get("x-pmcp-routing-token");
+    const routingToken = args["routing_token"] ?? headers.get("x-pmcp-routing-token");
     if (!routingToken) {
       await writeAudit({ auth, tool_name: tool.name, scope_used: tool.scope, resource, status_code: 428, latency_ms: Date.now() - startedAt, error_kind: "routing_token_missing", request_id });
-      return json({ error: "routing_token_required", hint: "call /api/openapi/mcp_route_task or /api/openapi/mcp_intake_submit first" }, 428);
+      return json(res, { error: "routing_token_required", hint: "call /api/openapi/mcp_route_task first" }, 428);
     }
     routing = await resolveRouting(routingToken);
     if (!routing) {
       await writeAudit({ auth, tool_name: tool.name, scope_used: tool.scope, resource, status_code: 428, latency_ms: Date.now() - startedAt, error_kind: "routing_token_invalid_or_expired", request_id });
-      return json({ error: "routing_token_invalid_or_expired" }, 428);
+      return json(res, { error: "routing_token_invalid_or_expired" }, 428);
     }
   }
   try {
     const output = await tool.handler(args, { auth, routing, request_id });
     const outBytes = JSON.stringify(output).length;
     await writeAudit({ auth, tool_name: tool.name, scope_used: tool.scope, resource, status_code: 200, latency_ms: Date.now() - startedAt, output_size: outBytes, request_id });
-    return json(output);
+    return json(res, output);
   } catch (e) {
     await writeAudit({ auth, tool_name: tool.name, scope_used: tool.scope, resource, status_code: 500, latency_ms: Date.now() - startedAt, error_kind: "tool_error", request_id });
-    return json({ error: "tool_error", detail: e.message }, 500);
+    return json(res, { error: "tool_error", detail: e.message }, 500);
   }
 }
 export {
