@@ -12,5 +12,9 @@
     "api/approve_command.js": {"maxDuration": 10},
     "api/mcp.js":             {"maxDuration": 30},
     "api/openapi.js":         {"maxDuration": 30}
-  }
+  },
+  "rewrites": [
+    {"source": "/api/mcp/:path*",     "destination": "/api/mcp"},
+    {"source": "/api/openapi/:path*", "destination": "/api/openapi"}
+  ]
 }
